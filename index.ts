@@ -139,16 +139,27 @@ function parseExactTime(timeStr: string): number | null {
 }
 
 // Schedule a message to be sent
-function scheduleMessage(channelId: string, content: string, delay: number, scheduledTimeOverride?: number): void {
-    const scheduledTime = scheduledTimeOverride ?? (Date.now() + delay);
+function scheduleMessage(
+    channelId: string,
+    content: string,
+    delay: number,
+    scheduledTimeOverride?: number
+): void {
+    const SEND_BUFFER_MS = 500; // 💖 2-second Discord safety buffer
+    const scheduledTime =
+        (scheduledTimeOverride ?? (Date.now() + delay)) + SEND_BUFFER_MS;
+
     const timeoutId = setTimeout(() => {
         sendMessage(channelId, { content });
-        // Remove from scheduled messages
-        const index = scheduledMessages.findIndex(msg => msg.timeoutId === timeoutId);
+
+        const index = scheduledMessages.findIndex(
+            msg => msg.timeoutId === timeoutId
+        );
         if (index !== -1) {
             scheduledMessages.splice(index, 1);
             saveScheduledMessages();
         }
+
         if (settings.store.showNotifications) {
             Vencord.Webpack.Common.Toasts.show({
                 type: Vencord.Webpack.Common.Toasts.Type.SUCCESS,
@@ -156,9 +167,17 @@ function scheduleMessage(channelId: string, content: string, delay: number, sche
                 id: "vc-scheduled-message-sent"
             });
         }
-    }, delay);
-    scheduledMessages.push({ channelId, content, scheduledTime, timeoutId });
+    }, delay + SEND_BUFFER_MS);
+
+    scheduledMessages.push({
+        channelId,
+        content,
+        scheduledTime,
+        timeoutId
+    });
+
     saveScheduledMessages();
+
     if (settings.store.showNotifications) {
         Vencord.Webpack.Common.Toasts.show({
             type: Vencord.Webpack.Common.Toasts.Type.SUCCESS,
@@ -223,24 +242,35 @@ export default definePlugin({
             description: "List all scheduled messages",
             inputType: ApplicationCommandInputType.BUILT_IN,
             execute: (_, ctx) => {
-                const channelMessages = scheduledMessages.filter(msg => msg.channelId === ctx.channel.id);
-
+                const channelMessages = scheduledMessages.filter(
+                    msg => msg.channelId === ctx.channel.id
+                );
+            
                 if (channelMessages.length === 0) {
                     sendBotMessage(ctx.channel.id, {
                         content: "No scheduled messages for this channel."
                     });
                     return;
                 }
-
+            
+                const now = Date.now();
+            
                 const messageList = channelMessages.map((msg, index) => {
-                    const timeStr = moment(msg.scheduledTime).format("LT");
-                    const preview = msg.content.length > 50
-                        ? msg.content.substring(0, 47) + "..."
-                        : msg.content;
-
-                    return `${index + 1}. **${timeStr}**: ${preview}`;
+                    const exactTime = moment(msg.scheduledTime).format("LT");
+                    const relativeTime = moment(msg.scheduledTime).fromNow();
+                    const hoursLeft = Math.max(
+                        0,
+                        Math.round((msg.scheduledTime - now) / (1000 * 60 * 60) * 10) / 10
+                    );
+                
+                    const preview =
+                        msg.content.length > 50
+                            ? msg.content.substring(0, 47) + "..."
+                            : msg.content;
+                
+                    return `${index + 1}. **${exactTime}** (${relativeTime}, ~${hoursLeft}h): ${preview}`;
                 }).join("\n");
-
+            
                 sendBotMessage(ctx.channel.id, {
                     content: `**Scheduled Messages:**\n${messageList}`
                 });
