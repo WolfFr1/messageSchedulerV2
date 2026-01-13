@@ -145,7 +145,7 @@ function scheduleMessage(
     delay: number,
     scheduledTimeOverride?: number
 ): void {
-    const SEND_BUFFER_MS = 500; // 💖 2-second Discord safety buffer
+    const SEND_BUFFER_MS = 500; // 0.5-second Discord safety buffer
     const scheduledTime =
         (scheduledTimeOverride ?? (Date.now() + delay)) + SEND_BUFFER_MS;
 
