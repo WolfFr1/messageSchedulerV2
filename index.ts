@@ -5,17 +5,19 @@
  */
 
 import { ApplicationCommandInputType, ApplicationCommandOptionType, sendBotMessage } from "@api/Commands";
+import * as DataStore from "@api/DataStore";
 import { definePluginSettings } from "@api/Settings";
 import { sendMessage } from "@utils/discord";
 import { Logger } from "@utils/Logger";
 import definePlugin, { OptionType } from "@utils/types";
 import { moment } from "@webpack/common";
-import * as DataStore from "@api/DataStore";
 
 interface ScheduledMessage {
     channelId: string;
     content: string;
     scheduledTime: number;
+    intervalMs?: number;
+    await?: boolean;
     timeoutId?: NodeJS.Timeout;
 }
 
@@ -32,7 +34,7 @@ let scheduledMessages: ScheduledMessage[] = [];
 const SCHEDULED_MESSAGES_KEY = "vc_scheduledMessages";
 // Save scheduled messages via DataStore (excluding timeoutId)
 function saveScheduledMessages() {
-    const toSave = scheduledMessages.map(({ channelId, content, scheduledTime }) => ({ channelId, content, scheduledTime }));
+    const toSave = scheduledMessages.map(({ channelId, content, scheduledTime, intervalMs }) => ({ channelId, content, scheduledTime, intervalMs }));
     // Fire-and-forget async save
     try {
         void DataStore.set(SCHEDULED_MESSAGES_KEY, toSave);
@@ -42,7 +44,7 @@ function saveScheduledMessages() {
 // Load scheduled messages via DataStore
 async function loadScheduledMessages() {
     try {
-        const data = await DataStore.get<Array<{ channelId: string; content: string; scheduledTime: number; }>>(SCHEDULED_MESSAGES_KEY);
+        const data = await DataStore.get<Array<{ channelId: string; content: string; scheduledTime: number; intervalMs?: number; }>>(SCHEDULED_MESSAGES_KEY);
         return data ?? [];
     } catch {
         return [];
@@ -138,27 +140,83 @@ function parseExactTime(timeStr: string): number | null {
     return null;
 }
 
-// Schedule a message to be sent
-function scheduleMessage(
-    channelId: string,
-    content: string,
-    delay: number,
-    scheduledTimeOverride?: number
-): void {
-    const SEND_BUFFER_MS = 500; // 0.5-second Discord safety buffer
-    const scheduledTime =
-        (scheduledTimeOverride ?? (Date.now() + delay)) + SEND_BUFFER_MS;
+function parseInterval(intervalStr: string): number | null {
+    const normalized = intervalStr.trim().toLowerCase();
+    if (!normalized) return null;
 
-    const timeoutId = setTimeout(() => {
-        sendMessage(channelId, { content });
+    const regex = /(\d+)\s*(d|day|days|h|hr|hour|hours|m|min|minute|minutes|s|sec|second|seconds)/g;
+    let totalMs = 0;
+    let matched = false;
+    let consumed = "";
+    let match: RegExpExecArray | null;
 
-        const index = scheduledMessages.findIndex(
-            msg => msg.timeoutId === timeoutId
-        );
-        if (index !== -1) {
-            scheduledMessages.splice(index, 1);
-            saveScheduledMessages();
+    while ((match = regex.exec(normalized)) !== null) {
+        matched = true;
+        consumed += match[0];
+        const value = parseInt(match[1], 10);
+        const unit = match[2];
+
+        if (["d", "day", "days"].includes(unit)) totalMs += value * 24 * 60 * 60 * 1000;
+        else if (["h", "hr", "hour", "hours"].includes(unit)) totalMs += value * 60 * 60 * 1000;
+        else if (["m", "min", "minute", "minutes"].includes(unit)) totalMs += value * 60 * 1000;
+        else if (["s", "sec", "second", "seconds"].includes(unit)) totalMs += value * 1000;
+    }
+
+    const leftovers = normalized
+        .replace(regex, "")
+        .replace(/[\s,]+/g, "");
+
+    if (!matched || leftovers.length > 0 || totalMs <= 0) return null;
+    return totalMs;
+}
+
+function formatInterval(intervalMs: number): string {
+    const days = Math.floor(intervalMs / (24 * 60 * 60 * 1000));
+    const hours = Math.floor((intervalMs % (24 * 60 * 60 * 1000)) / (60 * 60 * 1000));
+    const minutes = Math.floor((intervalMs % (60 * 60 * 1000)) / (60 * 1000));
+    const seconds = Math.floor((intervalMs % (60 * 1000)) / 1000);
+
+    const parts: string[] = [];
+    if (days) parts.push(`${days}d`);
+    if (hours) parts.push(`${hours}h`);
+    if (minutes) parts.push(`${minutes}m`);
+    if (seconds) parts.push(`${seconds}s`);
+    return parts.join(" ") || "0s";
+}
+
+function removeScheduledMessage(msg: ScheduledMessage): void {
+    const index = scheduledMessages.indexOf(msg);
+    if (index !== -1) {
+        scheduledMessages.splice(index, 1);
+        saveScheduledMessages();
+    }
+}
+
+function advanceToNextInterval(scheduledTime: number, intervalMs: number, now: number): number {
+    if (scheduledTime > now) return scheduledTime;
+    const skippedIntervals = Math.floor((now - scheduledTime) / intervalMs) + 1;
+    return scheduledTime + skippedIntervals * intervalMs;
+}
+
+function armScheduledMessage(msg: ScheduledMessage): void {
+    const delay = Math.max(0, msg.scheduledTime - Date.now());
+
+    msg.timeoutId = setTimeout(async () => {
+        if (msg.intervalMs && msg.await) {
+            await sendMessage(msg.channelId, { content: msg.content });
+        } else {
+            sendMessage(msg.channelId, { content: msg.content });
         }
+
+        if (msg.intervalMs && msg.intervalMs > 0) {
+            const nextBaseTime = msg.scheduledTime + msg.intervalMs;
+            msg.scheduledTime = advanceToNextInterval(nextBaseTime, msg.intervalMs, Date.now());
+            saveScheduledMessages();
+            armScheduledMessage(msg);
+            return;
+        }
+
+        removeScheduledMessage(msg);
 
         if (settings.store.showNotifications) {
             Vencord.Webpack.Common.Toasts.show({
@@ -167,21 +225,39 @@ function scheduleMessage(
                 id: "vc-scheduled-message-sent"
             });
         }
-    }, delay + SEND_BUFFER_MS);
+    }, delay);
+}
 
-    scheduledMessages.push({
+// Schedule a message to be sent
+function scheduleMessage(
+    channelId: string,
+    content: string,
+    delay: number,
+    scheduledTimeOverride?: number,
+    intervalMs?: number,
+    await?: boolean
+): void {
+    const scheduledTime = scheduledTimeOverride ?? (Date.now() + delay);
+
+    const scheduledMessage: ScheduledMessage = {
         channelId,
         content,
         scheduledTime,
-        timeoutId
-    });
+        intervalMs,
+        await
+    };
+
+    scheduledMessages.push(scheduledMessage);
+    armScheduledMessage(scheduledMessage);
 
     saveScheduledMessages();
 
     if (settings.store.showNotifications) {
         Vencord.Webpack.Common.Toasts.show({
             type: Vencord.Webpack.Common.Toasts.Type.SUCCESS,
-            message: `Message scheduled for ${moment(scheduledTime).format("LT")}`,
+            message: intervalMs
+                ? `Recurring message scheduled (every ${formatInterval(intervalMs)}), next send ${moment(scheduledTime).fromNow()}`
+                : `Message scheduled for ${moment(scheduledTime).format("LT")}`,
             id: "vc-message-scheduled"
         });
     }
@@ -210,11 +286,25 @@ export default definePlugin({
                     description: "When to send the message (e.g. '1h30m', '3:30pm')",
                     type: ApplicationCommandOptionType.STRING,
                     required: true
+                },
+                {
+                    name: "interval",
+                    description: "Optional repeat interval (e.g. '10m', '2h', '3 days', '10m30s')",
+                    type: ApplicationCommandOptionType.STRING,
+                    required: false
+                },
+                {
+                    name: "await",
+                    description: "Whether to wait for the message to be sent before scheduling the next one (only useful for intervals)",
+                    type: ApplicationCommandOptionType.BOOLEAN,
+                    required: false
                 }
             ],
             execute: (args, ctx) => {
                 const message = args.find(arg => arg.name === "message")?.value as string;
                 const timeStr = args.find(arg => arg.name === "time")?.value as string;
+                const intervalStr = args.find(arg => arg.name === "interval")?.value as string | undefined;
+                const awaitFlag = args.find(arg => arg.name === "await")?.value as boolean | undefined;
 
                 if (!message || !timeStr) {
                     sendBotMessage(ctx.channel.id, {
@@ -224,16 +314,30 @@ export default definePlugin({
                 }
 
                 // Use advanced time parser
-                let delay = parseAdvancedTime(timeStr);
+                const delay = parseAdvancedTime(timeStr);
                 if (delay === null || delay <= 0) {
                     sendBotMessage(ctx.channel.id, {
                         content: "❌ Invalid or past time format. Use 17h00, +17h00, +17h00+3d, 1h30m, etc."
                     });
                     return;
                 }
-                scheduleMessage(ctx.channel.id, message, delay);
+
+                let intervalMs: number | undefined;
+                if (intervalStr) {
+                    intervalMs = parseInterval(intervalStr) ?? undefined;
+                    if (!intervalMs || intervalMs <= 0) {
+                        sendBotMessage(ctx.channel.id, {
+                            content: "❌ Invalid interval. Use formats like '10m', '2h', '3 days', or '10m30s'."
+                        });
+                        return;
+                    }
+                }
+
+                scheduleMessage(ctx.channel.id, message, delay, undefined, intervalMs, awaitFlag);
                 sendBotMessage(ctx.channel.id, {
-                    content: `✅ Message scheduled to be sent ${moment().add(delay, "ms").fromNow()}.`
+                    content: intervalMs
+                        ? `✅ Recurring message scheduled. First send ${moment().add(delay, "ms").fromNow()}, then every ${formatInterval(intervalMs)}.`
+                        : `✅ Message scheduled to be sent ${moment().add(delay, "ms").fromNow()}.`
                 });
             }
         },
@@ -245,16 +349,16 @@ export default definePlugin({
                 const channelMessages = scheduledMessages.filter(
                     msg => msg.channelId === ctx.channel.id
                 );
-            
+
                 if (channelMessages.length === 0) {
                     sendBotMessage(ctx.channel.id, {
                         content: "No scheduled messages for this channel."
                     });
                     return;
                 }
-            
+
                 const now = Date.now();
-            
+
                 const messageList = channelMessages.map((msg, index) => {
                     const exactTime = moment(msg.scheduledTime).format("LT");
                     const relativeTime = moment(msg.scheduledTime).fromNow();
@@ -262,15 +366,19 @@ export default definePlugin({
                         0,
                         Math.round((msg.scheduledTime - now) / (1000 * 60 * 60) * 10) / 10
                     );
-                
+
                     const preview =
                         msg.content.length > 50
                             ? msg.content.substring(0, 47) + "..."
                             : msg.content;
-                
-                    return `${index + 1}. **${exactTime}** (${relativeTime}, ~${hoursLeft}h): ${preview}`;
+
+                    const intervalInfo = msg.intervalMs
+                        ? `, repeats every ${formatInterval(msg.intervalMs)}`
+                        : "";
+
+                    return `${index + 1}. **${exactTime}** (${relativeTime}, ~${hoursLeft}h${intervalInfo}): ${preview}`;
                 }).join("\n");
-            
+
                 sendBotMessage(ctx.channel.id, {
                     content: `**Scheduled Messages:**\n${messageList}`
                 });
@@ -336,13 +444,29 @@ export default definePlugin({
         scheduledMessages = [];
         let changed = false;
         for (const msg of loaded) {
-            const delay = msg.scheduledTime - Date.now();
+            const now = Date.now();
+            const restored: ScheduledMessage = {
+                channelId: msg.channelId,
+                content: msg.content,
+                scheduledTime: msg.scheduledTime,
+                intervalMs: msg.intervalMs
+            };
+
+            if (restored.intervalMs && restored.intervalMs > 0) {
+                const nextTime = advanceToNextInterval(restored.scheduledTime, restored.intervalMs, now);
+                if (nextTime !== restored.scheduledTime) {
+                    restored.scheduledTime = nextTime;
+                    changed = true;
+                }
+            }
+
+            const delay = restored.scheduledTime - now;
             if (delay > 0) {
                 // Restore timer for future messages
-                scheduleMessage(msg.channelId, msg.content, delay, msg.scheduledTime);
+                scheduledMessages.push(restored);
+                armScheduledMessage(restored);
             } else {
-                // If missed, send immediately and remove from storage
-                sendMessage(msg.channelId, { content: msg.content });
+                // Drop missed one-time messages while the plugin was offline.
                 changed = true;
             }
         }
